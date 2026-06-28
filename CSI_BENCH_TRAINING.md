@@ -538,7 +538,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/finetune.py \
 | 来源 | GaitID: Robust Wi-Fi Based Gait Recognition (WASA'2020) |
 | 任务 | User Identification (UID) |
 | 用户数 | 11 类 (user1~user11) |
-| 总 trials | ~3,652 (每 trial = 6 接收器) |
+| 总样本 | ~63,811 (6 接收器各自独立 × 滑动窗口) |
 | 环境 | Room#1 教室 (20190627~20190718) / Room#2 大厅 (20190719) |
 | 行走轨迹 | 4 条 (track 1~4, 不同位置/方向) |
 | 跨域方式 | `--held_out track_4` (cross-track) / `--held_out env_20190719` (cross-env) |
@@ -547,19 +547,6 @@ CUDA_VISIBLE_DEVICES=0 python scripts/finetune.py \
 **跨域说明**:
 - **cross-track**: 留出 track 4 作为测试集，训练集使用 track 1~3。全部 11 个用户可用。
 - **cross-env**: 留出 20190719 (Room #2 大厅) 作为测试环境，训练集使用 Room #1 (教室, 20190627~20190718)。测试集仅保留训练集中已出现的用户（user1, user2），避免跨环境+跨用户混杂。
-
-**FT 性能低于 supervised 的说明**:
-预训练模型仅在 CSI-Bench（单数据集）上训练，而原文使用了 14 个数据集。CSI-Bench 主要是 HAR 任务，与 GaitID 的 UID 任务存在领域差异。FT 时默认学习率 1e-4 会过快覆盖预训练特征（灾难性遗忘）。解决方案：
-1. **降低 FT 学习率**: FT 命令已改为 `--lr 5e-5`，更温和地微调
-2. **更少 epochs**: 可选 `--epochs 30` 配合早停（训练完成后选择最佳 val 权重）
-3. **两阶段微调**: 先 LP（冻结编码器训练分类头 10 epoch），再 FT（解冻全部用低 LR 微调 20 epoch），需手动分步执行
-
-**关于准确率无法达到论文水平的进一步分析**:
-即使 supervised（与预训练无关）也远低于论文的 92.7%（cross-track）/ 50.4%（cross-env），核心原因是**数据预处理差异**：
-1. **静态路径干扰**: 原始 CSI 幅度包含大量静态环境分量（墙壁、家具），步态的时变信号非常微弱（仅占总幅度的 ~2%）。模型学到的是 Room #1 的静态特征而非用户步态特征。
-2. **DC 去除修复**: 已添加 `csi_amp -= csi_amp.mean(axis=0)` 去除每个子载波的时间均值，仅保留时变运动分量。kNN 基线从 16% → 27%（cross-env），证明了该方法有效。
-3. **跨环境难度: Room #1→Room #2**: 我们的 cross-env 是两个不同房间（教室→大厅），原文可能使用同房间不同 session 作为"环境"，难度小得多。这是跨房间测试，更具挑战性。
-4. **跨设备/跨环境差异**: Room #1 和 Room #2 的 CSI 幅度分布差异大，DC 去除后 kNN 提升明显，但完全消除领域漂移仍需更大规模预训练数据。
 
 ---
 
@@ -570,7 +557,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/finetune.py \
 | `csibench` | HAR / UID / Prox | 5~6 | 55,684 (HAR) | 内置 split（`train_id` 自动排除跨域测试集）|
 | `wimans` | HAR | 9 | ~4,752 | `--held_out env_*` / `--held_out subject_*` |
 | `xrf55` | HAR | 55 | 22,000 | `--held_out env_*` / `--held_out subject_*` |
-| `gait` | UID | **11** | ~3,652 | `--held_out track_*` (cross-track) / `--held_out env_20190719` (cross-env) |
+| `gait` | UID | **11** | ~63,811 | `--held_out track_*` (cross-track) / `--held_out env_20190719` (cross-env) |
 
 **注意**: `csibench` 使用预定义的 split JSON 文件自动保证跨域测试集与训练集互斥；`wimans`、`xrf55` 和 `gait` 需要通过 `--held_out` 参数指定留出哪个 domain，每次运行训练一个 leave-one-out fold。
 
