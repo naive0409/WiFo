@@ -80,6 +80,34 @@ class DataEmbedding(nn.Module):
         return TokenEmb
 
 
+class PatchEmbed2D(nn.Module):
+    """
+    2D Linear Patch Embedding — 遵循 "Scale What Counts" 的设计
+    输入 (N, C, T, F) → 分块 → flatten → Linear → (N, L, embed_dim)
+
+    patch_size: (time_patch, freq_patch)
+    """
+    def __init__(self, in_chans=1, embed_dim=384, patch_size=(25, 8)):
+        super().__init__()
+        self.patch_size = patch_size
+        self.patch_dim = in_chans * patch_size[0] * patch_size[1]
+        self.proj = nn.Linear(self.patch_dim, embed_dim)
+
+    def forward(self, x):
+        B, C, T, F = x.shape
+        p_t, p_f = self.patch_size
+        assert T % p_t == 0 and F % p_f == 0, \
+            f"Input size ({T},{F}) must be divisible by patch size ({p_t},{p_f})"
+        n_t = T // p_t
+        n_f = F // p_f
+
+        # (B, C, n_t, p_t, n_f, p_f) → (B, n_t, n_f, p_t*p_f*C) → (B, n_t*n_f, embed_dim)
+        x = x.reshape(B, C, n_t, p_t, n_f, p_f)
+        x = x.permute(0, 2, 4, 3, 5, 1).reshape(B, n_t * n_f, -1)
+        x = self.proj(x)
+        return x  # (B, n_t*n_f, embed_dim)
+
+
 # --------------------------------------------------------
 # 2D sine-cosine position embedding
 # References:

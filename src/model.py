@@ -685,3 +685,189 @@ class WiFo(nn.Module):
 
         return loss1, loss2, pred_complex, target, mask
 
+
+# ═══════════════════════════════════════════════════════════════
+# WiFo2D — 遵循 "Scale What Counts" 的 2D MAE 架构
+# 输入: (N, 1, T, F)  幅度 CSI
+# Patch: (25, 8) → tokens
+# ═══════════════════════════════════════════════════════════════
+
+def WiFo2D_model(args, **kwargs):
+    """根据 size 返回 WiFo2D 实例"""
+    sizes = {
+        'tiny':  dict(embed_dim=192, depth=6,  num_heads=6, decoder_embed_dim=128, decoder_depth=4, decoder_num_heads=4),
+        'small': dict(embed_dim=384, depth=8,  num_heads=6, decoder_embed_dim=192, decoder_depth=4, decoder_num_heads=6),
+        'base':  dict(embed_dim=768, depth=12, num_heads=12, decoder_embed_dim=384, decoder_depth=4, decoder_num_heads=6),
+    }
+    cfg = sizes.get(args.size, sizes['tiny'])
+    return WiFo2D(
+        patch_size_time=args.patch_size_time,
+        patch_size_freq=args.patch_size_freq,
+        in_chans=1,
+        **cfg, **kwargs,
+    )
+
+
+class WiFo2D(nn.Module):
+    """2D Masked Autoencoder for CSI — 参考 'Scale What Counts' """
+
+    def __init__(self,
+                 patch_size_time=25, patch_size_freq=8, in_chans=1,
+                 embed_dim=384, depth=8, num_heads=6,
+                 decoder_embed_dim=192, decoder_depth=4, decoder_num_heads=6,
+                 mlp_ratio=4, norm_layer=nn.LayerNorm):
+        super().__init__()
+
+        self.patch_size = (patch_size_time, patch_size_freq)
+        self.patch_dim = in_chans * patch_size_time * patch_size_freq
+        self.embed_dim = embed_dim
+        self.decoder_embed_dim = decoder_embed_dim
+
+        # ── Patch embedding (Linear projection, 遵循 "Scale What Counts") ──
+        self.patch_embed = nn.Linear(self.patch_dim, embed_dim)
+
+        # ── 位置编码 (2D SinCos, 复用 WiFo 代码) ──
+        # 在 forward 中动态生成
+
+        # ── Encoder ──
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, num_heads, mlp_ratio,
+                  qkv_bias=True, norm_layer=norm_layer)
+            for _ in range(depth)
+        ])
+        self.norm = norm_layer(embed_dim)
+
+        # ── Decoder ──
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio,
+                  qkv_bias=True, norm_layer=norm_layer)
+            for _ in range(decoder_depth)
+        ])
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, self.patch_dim)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        torch.nn.init.normal_(self.mask_token, std=0.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def patchify(self, x):
+        """将 (N, C, T, F) 分解为 patch 序列 (N, L, patch_dim)"""
+        B, C, T, F = x.shape
+        p_t, p_f = self.patch_size
+        n_t, n_f = T // p_t, F // p_f
+        x = x.reshape(B, C, n_t, p_t, n_f, p_f)
+        x = x.permute(0, 2, 4, 3, 5, 1).reshape(B, n_t * n_f, -1)
+        return x  # (B, L, patch_dim)
+
+    def unpatchify(self, x, T, F):
+        """将 (N, L, patch_dim) 还原为 (N, C, T, F)"""
+        B, L, _ = x.shape
+        p_t, p_f = self.patch_size
+        n_t, n_f = T // p_t, F // p_f
+        x = x.reshape(B, n_t, n_f, p_t, p_f, -1)
+        x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, -1, T, F)
+        return x
+
+    def random_masking(self, x, mask_ratio):
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        return x_masked, mask, ids_restore
+
+    def forward_encoder(self, x, mask_ratio):
+        # x: (N, 1, T, F)
+        B, C, T, F = x.shape
+        p_t, p_f = self.patch_size
+        n_t, n_f = T // p_t, F // p_f
+
+        # patch embed + flatten
+        x = self.patchify(x)                           # (B, L, patch_dim)
+        x = self.patch_embed(x)                        # (B, L, embed_dim)
+
+        # 2D SinCos 位置编码 (动态生成)
+        pos = torch.from_numpy(
+            get_2d_sincos_pos_embed(self.embed_dim, n_t, n_f)
+        ).float().unsqueeze(0).to(x.device)            # (1, L, embed_dim)
+        x = x + pos
+
+        # masking
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+
+        # Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+
+        return x, mask, ids_restore, (T, F)
+
+    def forward_decoder(self, x, ids_restore, input_size):
+        T, F = input_size
+        B = x.shape[0]
+        p_t, p_f = self.patch_size
+        n_t, n_f = T // p_t, F // p_f
+        L = n_t * n_f
+
+        x = self.decoder_embed(x)                      # (B, len_keep, dec_dim)
+
+        # 用 mask_token 填充被遮掩的位置
+        mask_tokens = self.mask_token.repeat(B, L - x.shape[1], 1)
+        x = torch.cat([x, mask_tokens], dim=1)         # (B, L, dec_dim)
+        x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[-1]))
+
+        # decoder 位置编码
+        pos = torch.from_numpy(
+            get_2d_sincos_pos_embed(self.decoder_embed_dim, n_t, n_f)
+        ).float().unsqueeze(0).to(x.device)
+        x = x + pos
+
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        x = self.decoder_pred(x)                       # (B, L, patch_dim)
+        return x
+
+    def forward_loss(self, target_patches, pred, mask):
+        """MSE loss on masked patches only"""
+        loss = (pred - target_patches) ** 2
+        loss = loss.mean(dim=-1)                       # (B, L)
+        mask = mask.view(loss.shape)
+        loss_masked = (loss * mask).sum() / (mask.sum() + 1e-8)
+        return loss_masked
+
+    def forward(self, imgs, mask_ratio=0.8, **kwargs):
+        # imgs: list of tensors → stack
+        if isinstance(imgs, list):
+            imgs = torch.stack(imgs).squeeze(1)
+
+        # 标准化 (per-sample Z-score 已在 DataLoader 中完成)
+        B, C, T, F = imgs.shape
+
+        latent, mask, ids_restore, input_size = self.forward_encoder(imgs, mask_ratio)
+        pred = self.forward_decoder(latent, ids_restore, input_size)
+
+        # target patches for loss
+        target = self.patchify(imgs)                   # (B, L, patch_dim)
+
+        loss = self.forward_loss(target, pred, mask)
+        return loss, loss, pred, target, mask
+

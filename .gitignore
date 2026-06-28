@@ -1,1 +1,8 @@
 CSI-Bench-Real-WiFi-Sensing-Benchmark/
+src/__pycache__
+experiments
+train_log
+visualizations
+train*.sh
+shell.sh
+finetune.sh
